@@ -36,6 +36,14 @@ vi.mock('../transcription.js', () => ({
   transcribeAudioBuffer: vi.fn().mockResolvedValue('hello from telegram'),
 }));
 
+// Mock image module (used by message:photo handler)
+vi.mock('../image.js', () => ({
+  processImage: vi.fn().mockResolvedValue({
+    content: '[Image: attachments/img-test.jpg]',
+    relativePath: 'attachments/img-test.jpg',
+  }),
+}));
+
 // --- Grammy mock ---
 
 type Handler = (...args: any[]) => any;
@@ -84,6 +92,7 @@ vi.mock('grammy', () => ({
 
 import fs from 'fs';
 import { TelegramChannel, TelegramChannelOpts } from './telegram.js';
+import { processImage } from '../image.js';
 import { transcribeAudioBuffer } from '../transcription.js';
 
 // --- Test helpers ---
@@ -682,7 +691,7 @@ describe('TelegramChannel', () => {
   // --- Non-text messages ---
 
   describe('non-text messages', () => {
-    it('downloads photo and includes path in content', async () => {
+    it('processes photo via image vision pipeline', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
@@ -699,15 +708,16 @@ describe('TelegramChannel', () => {
       await flushPromises();
 
       expect(currentBot().api.getFile).toHaveBeenCalledWith('large_id');
+      expect(processImage).toHaveBeenCalled();
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
         expect.objectContaining({
-          content: '[Photo] (/workspace/group/attachments/photo_1.jpg)',
+          content: '[Image: attachments/img-test.jpg]',
         }),
       );
     });
 
-    it('downloads photo with caption', async () => {
+    it('passes caption to processImage', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
@@ -719,16 +729,14 @@ describe('TelegramChannel', () => {
       await triggerMediaMessage('message:photo', ctx);
       await flushPromises();
 
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'tg:100200300',
-        expect.objectContaining({
-          content:
-            '[Photo] (/workspace/group/attachments/photo_1.jpg) Look at this',
-        }),
+      expect(processImage).toHaveBeenCalledWith(
+        expect.any(Buffer),
+        expect.any(String),
+        'Look at this',
       );
     });
 
-    it('falls back to placeholder when download fails', async () => {
+    it('falls back to placeholder when photo download fails', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
@@ -747,6 +755,43 @@ describe('TelegramChannel', () => {
         'tg:100200300',
         expect.objectContaining({ content: '[Photo] Check this' }),
       );
+    });
+
+    it('falls back when processImage returns null', async () => {
+      vi.mocked(processImage).mockResolvedValueOnce(null);
+
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        caption: 'Check this',
+        extra: { photo: [{ file_id: 'photo_id', width: 800 }] },
+      });
+      await triggerMediaMessage('message:photo', ctx);
+      await flushPromises();
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({ content: '[Photo] Check this' }),
+      );
+    });
+
+    it('skips photo from unregistered chat', async () => {
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({})),
+      });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        extra: { photo: [{ file_id: 'photo_id', width: 800 }] },
+      });
+      await triggerMediaMessage('message:photo', ctx);
+      await flushPromises();
+
+      expect(processImage).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
     });
 
     it('downloads document and includes filename and path', async () => {

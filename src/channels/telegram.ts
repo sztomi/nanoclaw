@@ -7,6 +7,7 @@ import { Api, Bot } from 'grammy';
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
+import { processImage } from '../image.js';
 import { logger } from '../logger.js';
 import { transcribeAudioBuffer } from '../transcription.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -63,9 +64,7 @@ export class TelegramChannel implements Channel {
    * Used by handlers that pass the bytes to a processor (image vision,
    * voice transcription) instead of saving them to disk first.
    */
-  private async downloadFileToBuffer(
-    fileId: string,
-  ): Promise<Buffer | null> {
+  private async downloadFileToBuffer(fileId: string): Promise<Buffer | null> {
     if (!this.bot) return null;
 
     try {
@@ -331,14 +330,78 @@ export class TelegramChannel implements Channel {
       deliver(`${placeholder}${caption}`);
     };
 
-    this.bot.on('message:photo', (ctx) => {
+    this.bot.on('message:photo', async (ctx) => {
+      // Photos go through processImage(): the host downloads the largest size,
+      // sharp resizes to ≤1024×1024 JPEG @ Q85, saves to attachments/, and
+      // emits an `[Image: attachments/img-X.jpg]` text marker. Downstream
+      // (parseImageReferences in src/index.ts → ContainerInput.imageAttachments
+      // → multimodal blocks in the agent-runner) is channel-agnostic and
+      // picks the marker up automatically.
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
       // Telegram sends multiple sizes; last is largest
       const photos = ctx.message.photo;
       const largest = photos?.[photos.length - 1];
-      storeMedia(ctx, '[Photo]', {
-        fileId: largest?.file_id,
-        filename: `photo_${ctx.message.message_id}`,
-      });
+      const fileId = largest?.file_id;
+      if (!fileId) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      const deliver = (content: string): void => {
+        this.opts.onMessage(chatJid, {
+          id: ctx.message.message_id.toString(),
+          chat_jid: chatJid,
+          sender: ctx.from?.id?.toString() || '',
+          sender_name: senderName,
+          content,
+          timestamp,
+          is_from_me: false,
+        });
+      };
+
+      const caption = ctx.message.caption ?? '';
+
+      try {
+        const buffer = await this.downloadFileToBuffer(fileId);
+        if (!buffer) {
+          deliver(caption ? `[Photo] ${caption}` : '[Photo]');
+          return;
+        }
+
+        const groupDir = resolveGroupFolderPath(group.folder);
+        const result = await processImage(buffer, groupDir, caption);
+        if (result) {
+          logger.info(
+            { jid: chatJid, path: result.relativePath },
+            'Processed Telegram image',
+          );
+          deliver(result.content);
+        } else {
+          deliver(caption ? `[Photo] ${caption}` : '[Photo]');
+        }
+      } catch (err) {
+        logger.warn(
+          { jid: chatJid, err },
+          'Telegram image - processing failed',
+        );
+        deliver(caption ? `[Photo] ${caption}` : '[Photo]');
+      }
     });
     this.bot.on('message:video', (ctx) => {
       storeMedia(ctx, '[Video]', {
@@ -419,9 +482,7 @@ export class TelegramChannel implements Channel {
           );
           deliver(`[Voice: ${transcript}]`);
         } else {
-          deliver(
-            `[Voice Message - transcription unavailable] (${savedPath})`,
-          );
+          deliver(`[Voice Message - transcription unavailable] (${savedPath})`);
         }
       } catch (err) {
         logger.error(
