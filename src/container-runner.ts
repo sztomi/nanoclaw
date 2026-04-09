@@ -23,6 +23,7 @@ import {
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
+  userNamespaceArgs,
 } from './container-runtime.js';
 import { OneCLI } from '@onecli-sh/sdk';
 import { validateAdditionalMounts } from './mount-security.js';
@@ -269,6 +270,10 @@ async function buildContainerArgs(
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
+
+  // Rootless Podman: map host uid back to container uid so bind-mounted IPC
+  // files written by the host can be unlinked by the container's node user.
+  args.push(...userNamespaceArgs());
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
