@@ -18,6 +18,8 @@ const DEFAULT_CONFIG: TranscriptionConfig = {
 async function transcribeWithOpenAI(
   audioBuffer: Buffer,
   config: TranscriptionConfig,
+  filename: string,
+  mimeType: string,
 ): Promise<string | null> {
   const env = readEnvFile(['OPENAI_API_KEY']);
   const apiKey = env.OPENAI_API_KEY;
@@ -34,8 +36,8 @@ async function transcribeWithOpenAI(
 
     const openai = new OpenAI({ apiKey });
 
-    const file = await toFile(audioBuffer, 'voice.ogg', {
-      type: 'audio/ogg',
+    const file = await toFile(audioBuffer, filename, {
+      type: mimeType,
     });
 
     const transcription = await openai.audio.transcriptions.create({
@@ -50,6 +52,34 @@ async function transcribeWithOpenAI(
     console.error('OpenAI transcription failed:', err);
     return null;
   }
+}
+
+/**
+ * Channel-neutral entry point: takes a raw audio buffer and returns a
+ * transcript or null. Defaults assume a WhatsApp/Telegram-style PTT voice
+ * note (OGG Opus); pass `filename`/`mimeType` for other formats.
+ *
+ * Returns null on missing API key or any failure — callers should fall back
+ * to their own placeholder text. (Distinct from `transcribeAudioMessage`,
+ * which returns the configured fallback string instead of null.)
+ */
+export async function transcribeAudioBuffer(
+  buffer: Buffer,
+  opts: { filename?: string; mimeType?: string } = {},
+): Promise<string | null> {
+  if (!buffer || buffer.length === 0) return null;
+
+  const filename = opts.filename ?? 'voice.ogg';
+  const mimeType = opts.mimeType ?? 'audio/ogg';
+
+  const transcript = await transcribeWithOpenAI(
+    buffer,
+    DEFAULT_CONFIG,
+    filename,
+    mimeType,
+  );
+
+  return transcript ? transcript.trim() : null;
 }
 
 export async function transcribeAudioMessage(
@@ -80,7 +110,12 @@ export async function transcribeAudioMessage(
 
     console.log(`Downloaded audio message: ${buffer.length} bytes`);
 
-    const transcript = await transcribeWithOpenAI(buffer, config);
+    const transcript = await transcribeWithOpenAI(
+      buffer,
+      config,
+      'voice.ogg',
+      'audio/ogg',
+    );
 
     if (!transcript) {
       return config.fallbackMessage;
