@@ -41,6 +41,7 @@ import pino from 'pino';
 
 // Baileys requires a pino-compatible logger instance
 const baileysLogger = pino({ level: 'silent' });
+import { isImageMessage, processImage } from '../image.js';
 import { isVoiceMessage, transcribeAudioMessage } from '../transcription.js';
 import {
   Channel,
@@ -303,6 +304,34 @@ export class WhatsAppChannel implements Channel {
                 `@${this.botLidUser}`,
                 `@${ASSISTANT_NAME}`,
               );
+            }
+
+            // Image attachment handling: download, resize, save the resized
+            // JPEG, replace `content` with the `[Image: ...]` marker that
+            // parseImageReferences in src/index.ts later picks up.
+            if (isImageMessage(msg)) {
+              try {
+                const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                const groupDir = path.join(GROUPS_DIR, groups[chatJid].folder);
+                const caption = normalized?.imageMessage?.caption ?? '';
+                const result = await processImage(
+                  buffer as Buffer,
+                  groupDir,
+                  caption,
+                );
+                if (result) {
+                  content = result.content;
+                  logger.info(
+                    { jid: chatJid, path: result.relativePath },
+                    'Processed image attachment',
+                  );
+                }
+              } catch (err) {
+                logger.warn(
+                  { err, jid: chatJid },
+                  'Image attachment - download failed',
+                );
+              }
             }
 
             // PDF attachment handling
