@@ -8,6 +8,7 @@ import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
+import { transcribeAudioBuffer } from '../transcription.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -55,6 +56,40 @@ export class TelegramChannel implements Channel {
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
     this.opts = opts;
+  }
+
+  /**
+   * Download a Telegram file by file_id and return the raw bytes as a Buffer.
+   * Used by handlers that pass the bytes to a processor (image vision,
+   * voice transcription) instead of saving them to disk first.
+   */
+  private async downloadFileToBuffer(
+    fileId: string,
+  ): Promise<Buffer | null> {
+    if (!this.bot) return null;
+
+    try {
+      const file = await this.bot.api.getFile(fileId);
+      if (!file.file_path) {
+        logger.warn({ fileId }, 'Telegram getFile returned no file_path');
+        return null;
+      }
+
+      const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+      const resp = await fetch(fileUrl);
+      if (!resp.ok) {
+        logger.warn(
+          { fileId, status: resp.status },
+          'Telegram file download failed',
+        );
+        return null;
+      }
+
+      return Buffer.from(await resp.arrayBuffer());
+    } catch (err) {
+      logger.error({ fileId, err }, 'Failed to download Telegram file');
+      return null;
+    }
   }
 
   /**
@@ -311,11 +346,90 @@ export class TelegramChannel implements Channel {
         filename: `video_${ctx.message.message_id}`,
       });
     });
-    this.bot.on('message:voice', (ctx) => {
-      storeMedia(ctx, '[Voice message]', {
-        fileId: ctx.message.voice?.file_id,
-        filename: `voice_${ctx.message.message_id}`,
-      });
+    this.bot.on('message:voice', async (ctx) => {
+      // Voice notes get transcribed via OpenAI Whisper before delivery so the
+      // agent receives the spoken content as readable text. Falls back to a
+      // placeholder + saved file path on failure (no API key, network error,
+      // etc.) so the user still has the audio if they want to manually deal
+      // with it.
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const fileId = ctx.message.voice?.file_id;
+      if (!fileId) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      const deliver = (content: string): void => {
+        this.opts.onMessage(chatJid, {
+          id: ctx.message.message_id.toString(),
+          chat_jid: chatJid,
+          sender: ctx.from?.id?.toString() || '',
+          sender_name: senderName,
+          content,
+          timestamp,
+          is_from_me: false,
+        });
+      };
+
+      // Always save the .ogg to attachments/ — useful when transcription
+      // fails or the user later asks the agent to re-process the audio.
+      const saveBufferToDisk = (buffer: Buffer): string => {
+        const groupDir = resolveGroupFolderPath(group.folder);
+        const attachDir = path.join(groupDir, 'attachments');
+        fs.mkdirSync(attachDir, { recursive: true });
+        const filename = `voice_${ctx.message.message_id}.ogg`;
+        const filePath = path.join(attachDir, filename);
+        fs.writeFileSync(filePath, buffer);
+        return `/workspace/group/attachments/${filename}`;
+      };
+
+      try {
+        const buffer = await this.downloadFileToBuffer(fileId);
+        if (!buffer) {
+          deliver('[Voice message - download failed]');
+          return;
+        }
+        const savedPath = saveBufferToDisk(buffer);
+
+        const transcript = await transcribeAudioBuffer(buffer, {
+          filename: 'voice.ogg',
+          mimeType: 'audio/ogg',
+        });
+
+        if (transcript) {
+          logger.info(
+            { jid: chatJid, length: transcript.length },
+            'Transcribed Telegram voice message',
+          );
+          deliver(`[Voice: ${transcript}]`);
+        } else {
+          deliver(
+            `[Voice Message - transcription unavailable] (${savedPath})`,
+          );
+        }
+      } catch (err) {
+        logger.error(
+          { jid: chatJid, err },
+          'Telegram voice transcription threw',
+        );
+        deliver('[Voice Message - transcription failed]');
+      }
     });
     this.bot.on('message:audio', (ctx) => {
       const name =
