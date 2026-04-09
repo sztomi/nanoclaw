@@ -343,6 +343,23 @@ async function pollAuthCompletion(
     const content = readFileSafe(statusFile);
 
     if (content === 'authenticated' || content === 'already_authenticated') {
+      // Wait for creds.json to be fully flushed by baileys before declaring
+      // success. Without this, the parent's cleanup() can SIGKILL the child
+      // mid-write, leaving an empty creds.json.
+      const credsPath = path.join(
+        projectRoot,
+        'store',
+        'auth',
+        'creds.json',
+      );
+      for (let j = 0; j < 50; j++) {
+        try {
+          if (fs.statSync(credsPath).size > 0) break;
+        } catch {
+          /* not yet */
+        }
+        await sleep(200);
+      }
       // Write success page if qr-auth.html exists
       const htmlPath = path.join(projectRoot, 'store', 'qr-auth.html');
       if (fs.existsSync(htmlPath)) {
