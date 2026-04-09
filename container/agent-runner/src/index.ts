@@ -36,9 +36,15 @@ interface ContainerInput {
   imageAttachments?: Array<{ relativePath: string; mediaType: string }>;
 }
 
+type ImageMediaType =
+  | 'image/jpeg'
+  | 'image/png'
+  | 'image/gif'
+  | 'image/webp';
+
 interface ImageContentBlock {
   type: 'image';
-  source: { type: 'base64'; media_type: string; data: string };
+  source: { type: 'base64'; media_type: ImageMediaType; data: string };
 }
 interface TextContentBlock {
   type: 'text';
@@ -417,9 +423,18 @@ async function runQuery(
       const imgPath = path.join('/workspace/group', img.relativePath);
       try {
         const data = fs.readFileSync(imgPath).toString('base64');
+        // Narrow the host-supplied mime to the SDK's accepted union.
+        // processImage() always emits image/jpeg, but be defensive about
+        // other channels in case they bypass that and pass png/webp/gif.
+        const mediaType: ImageMediaType =
+          img.mediaType === 'image/png' ||
+          img.mediaType === 'image/gif' ||
+          img.mediaType === 'image/webp'
+            ? img.mediaType
+            : 'image/jpeg';
         blocks.push({
           type: 'image',
-          source: { type: 'base64', media_type: img.mediaType, data },
+          source: { type: 'base64', media_type: mediaType, data },
         });
       } catch {
         log(`Failed to load image: ${imgPath}`);
